@@ -16,7 +16,7 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, interpolate_bilinear, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
-from .conv import Conv, DWConv
+from .conv import Conv, ConvTranspose, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob
 
@@ -28,6 +28,7 @@ __all__ = (
     "Pose",
     "RTDETRDecoder",
     "Segment",
+    "Segment26RoI",
     "SemanticSegment",
     "YOLOEDetect",
     "YOLOESegment",
@@ -459,6 +460,169 @@ class Segment26(Segment):
         super().fuse()
         if hasattr(self.proto, "fuse"):
             self.proto.fuse()
+
+
+class Segment26RoI(Detect):
+    """YOLO26 instance-segmentation head that predicts masks with RoIAlign instead of prototypes.
+
+    The box and class branches stay the YOLO26 end-to-end head. At train and infer time, masks are decoded from the
+    one-to-one boxes: each box is assigned to P3, P4, or P5 by its size, RoIAlign crops a window from that map, and a
+    small class-agnostic conv stack upsamples it to a mask. Class-agnostic masks keep the head small and avoid a
+    per-class mask tensor. There is no Proto26 module and no auxiliary semantic loss.
+
+    Attributes:
+        roi_masks (bool): Marks this head so predictors paste RoI masks instead of combining prototypes.
+        roi_size (int): RoIAlign window, in feature pixels.
+        mask_channels (int): Width of the RoI feature and the mask conv stack.
+        mask_size (int): Mask logits resolution after the stride-2 upsample (`2 * roi_size`).
+        roi_proj (nn.ModuleList): 1x1 projections that map each FPN level to `mask_channels`.
+        mask_head (nn.Sequential): Two 3x3 convs, a 2x upsample, and a 1x1 logit layer.
+        mask_imgsz (tuple[int, int] | None): Input image height and width from the latest inference forward.
+
+    Examples:
+        Build the head the same way the YAML parser does
+        >>> head = Segment26RoI(nc=80, roi_size=14, mask_channels=32, reg_max=1, end2end=True, ch=(32, 64, 128))
+    """
+
+    roi_masks = True
+
+    def __init__(
+        self,
+        nc: int = 80,
+        roi_size: int = 14,
+        mask_channels: int = 128,
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: list[int] | tuple[int, ...] = (),
+    ):
+        """Initialize box, class, and class-agnostic RoI mask branches.
+
+        Args:
+            nc (int): Number of classes.
+            roi_size (int): Square RoIAlign output size. The mask head upsamples it by 2.
+            mask_channels (int): Channels inside the RoI mask head.
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Must be True. Masks are cropped from one-to-one boxes.
+            ch (list[int] | tuple[int, ...]): Channel sizes from the P3, P4, and P5 feature maps.
+        """
+        super().__init__(nc, reg_max, end2end, ch)
+        if getattr(self, "one2one_cv2", None) is None:
+            raise ValueError("Segment26RoI requires end2end=True so masks use one-to-one boxes.")
+        self.roi_size = int(roi_size)
+        self.mask_channels = int(mask_channels)
+        self.mask_size = self.roi_size * 2
+        self.mask_imgsz = None
+        masks = self.mask_channels
+        self.roi_proj = nn.ModuleList(Conv(c, masks, 1) for c in ch)
+        self.mask_head = nn.Sequential(
+            Conv(masks, masks, 3),
+            Conv(masks, masks, 3),
+            ConvTranspose(masks, masks, 2, 2),
+            nn.Conv2d(masks, 1, 1),
+        )
+
+    @property
+    def end2end(self):
+        """Return True whenever the one-to-one head exists.
+
+        RoI masks are defined on the NMS-free boxes, so inference does not switch back to the one-to-many head.
+        """
+        return getattr(self, "one2one_cv2", None) is not None
+
+    @end2end.setter
+    def end2end(self, value):
+        """Keep one-to-one inference selected. `value` is ignored while the one-to-one head exists."""
+        self._end2end = self.end2end
+
+    def mask_only_freeze(self, head_index: int) -> list[str]:
+        """Return trainer `freeze` keys for every submodule except the RoI mask head.
+
+        Stage 1 trains `roi_proj` and `mask_head` only. Prepend the backbone and neck indices,
+        ``list(range(head_index))``, to the list this returns. Stage 2 is a normal train with `freeze` unset.
+
+        Args:
+            head_index (int): Index of this head in `model.model`, usually `len(model.model) - 1`.
+
+        Returns:
+            (list[str]): Module names relative to the parsed sequential model, such as ``"23.cv2"``.
+        """
+        return [f"{head_index}.{name}" for name, _ in self.named_children() if name not in {"roi_proj", "mask_head"}]
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | dict[str, torch.Tensor]:
+        """Run the detection head and, at inference, attach one class-agnostic mask per one-to-one box.
+
+        Training returns the usual one-to-many and one-to-one dict and stores projected FPN features on the one-to-one
+        branch for the mask loss. Inference returns `((boxes, mask_logits), raw)` where `boxes` is `(B, max_det, 6)`
+        and `mask_logits` is `(B, max_det, mask_size, mask_size)`.
+
+        Raises:
+            NotImplementedError: If `export` is set. ONNX and the other exporters do not support this head.
+        """
+        if self.export:
+            raise NotImplementedError(
+                "Segment26RoI export is not supported (RoIAlign mask head). "
+                "Use yolo26-seg.yaml for exported segmentation, or run this variant in PyTorch."
+            )
+        outputs = Detect.forward(self, x)
+        projected = [proj(feat) for proj, feat in zip(self.roi_proj, x)]
+        raw = outputs[1] if isinstance(outputs, tuple) else outputs
+        if isinstance(raw, dict):
+            branch = raw.get("one2one", raw)
+            branch["roi_feats"] = projected
+        if self.training:
+            return raw
+        boxes = outputs[0]
+        stride0 = float(self.stride[0])
+        self.mask_imgsz = (int(x[0].shape[-2] * stride0), int(x[0].shape[-1] * stride0))
+        return (boxes, self.mask_logits(projected, boxes[..., :4])), raw
+
+    def mask_logits(
+        self, feats: list[torch.Tensor], boxes: torch.Tensor, batch_idx: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Predict class-agnostic mask logits for image-pixel xyxy boxes.
+
+        Args:
+            feats (list[torch.Tensor]): Projected P3, P4, and P5 maps, each `(B, mask_channels, H, W)`.
+            boxes (torch.Tensor): Boxes in input-image pixels, shaped `(B, N, 4)` or `(R, 4)` when `batch_idx` is set.
+            batch_idx (torch.Tensor | None): Image index per row of a flat `(R, 4)` box tensor.
+
+        Returns:
+            (torch.Tensor): Logits shaped `(B, N, mask_size, mask_size)` or `(R, mask_size, mask_size)`.
+        """
+        if batch_idx is None:
+            batch, count, _ = boxes.shape
+            flat = self._valid_xyxy(boxes.detach()).reshape(-1, 4)
+            batch_idx = torch.arange(batch, device=boxes.device).repeat_interleave(count)
+            return self._flat_mask_logits(feats, flat, batch_idx).view(batch, count, self.mask_size, self.mask_size)
+        return self._flat_mask_logits(feats, self._valid_xyxy(boxes.detach()), batch_idx)
+
+    def _flat_mask_logits(
+        self, feats: list[torch.Tensor], boxes: torch.Tensor, batch_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """RoIAlign each box from one FPN level and run the mask stack. `boxes` are already clamped xyxy pixels."""
+        from ultralytics.utils.ops import roi_align
+
+        count = boxes.shape[0]
+        if count == 0:
+            return boxes.new_zeros(0, self.mask_size, self.mask_size)
+        wh = (boxes[:, 2:] - boxes[:, :2]).clamp(min=1)
+        # FPN: level 4 (stride 16) is the canonical 224px box. P3/P4/P5 are levels 3/4/5.
+        level = (4 + torch.log2(wh.prod(1).sqrt() / 224)).floor().to(torch.long) - 3
+        level = level.clamp_(0, len(feats) - 1)
+        rois = torch.cat((batch_idx.to(boxes.dtype).unsqueeze(1), boxes), 1)
+        pooled = [
+            roi_align(feat, rois, self.roi_size, spatial_scale=1.0 / float(stride), sampling_ratio=2)
+            for feat, stride in zip(feats, self.stride.tolist())
+        ]
+        stacked = torch.stack(pooled, 0)
+        index = level.view(1, count, 1, 1, 1).expand(1, count, self.mask_channels, self.roi_size, self.roi_size)
+        return self.mask_head(stacked.gather(0, index).squeeze(0)).squeeze(1)
+
+    @staticmethod
+    def _valid_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+        """Return xyxy boxes whose width and height are at least one pixel."""
+        x1, y1, x2, y2 = boxes.unbind(-1)
+        return torch.stack((x1, y1, torch.maximum(x2, x1 + 1), torch.maximum(y2, y1 + 1)), -1)
 
 
 class OBB(Detect):

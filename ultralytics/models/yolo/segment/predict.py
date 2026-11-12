@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.detect.predict import DetectionPredictor
-from ultralytics.utils import DEFAULT_CFG, ops
+from ultralytics.utils import DEFAULT_CFG, nms, ops
 
 
 class SegmentationPredictor(DetectionPredictor):
@@ -61,9 +61,52 @@ class SegmentationPredictor(DetectionPredictor):
             >>> predictor = SegmentationPredictor(overrides=dict(model="yolo26n-seg.pt"))
             >>> results = predictor.postprocess(preds, img, orig_img)
         """
+        # RoI heads already decoded one-to-one boxes and per-box mask logits. Prototype heads still ship coefficients.
+        roi = ops.roi_mask_pair(preds)
+        if roi is not None:
+            return self._postprocess_roi(*roi, img, orig_imgs)
         # Extract protos - tuple if PyTorch model or array if exported
         protos = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         return super().postprocess(preds[0], img, orig_imgs, protos=protos)
+
+    def _postprocess_roi(self, det, roi_masks, img, orig_imgs):
+        """Filter one-to-one boxes by confidence and paste each RoI mask into the image."""
+        preds, keepi = nms.non_max_suppression(
+            det,
+            self.args.conf,
+            self.args.iou,
+            self.args.classes,
+            self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            nc=len(self.model.names),
+            end2end=True,
+            return_idxs=True,
+        )
+        if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
+            orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)[..., ::-1]
+        return [
+            self._construct_roi_result(pred, idx, masks, img, orig_img, img_path)
+            for pred, idx, masks, orig_img, img_path in zip(preds, keepi, roi_masks, orig_imgs, self.batch[0])
+        ]
+
+    def _construct_roi_result(self, pred, idx, roi_masks, img, orig_img, img_path):
+        """Build one Results object by pasting RoI logits into the letterboxed or original image."""
+        if pred.shape[0] == 0:
+            masks = None
+        else:
+            roi = roi_masks[idx]
+            if self.args.retina_masks or self.args.tile:
+                pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+                masks = ops.paste_roi_masks(roi, pred[:, :4], orig_img.shape[:2])
+            else:
+                masks = ops.paste_roi_masks(roi, pred[:, :4], img.shape[2:])
+                pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+            keep = masks.amax((-2, -1)) > 0  # only keep predictions with masks
+            if not keep.all():
+                pred, masks = pred[keep], masks[keep]
+            if pred.shape[0] == 0:
+                masks = None
+        return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], masks=masks)
 
     def construct_results(self, preds, img, orig_imgs, protos):
         """Construct a list of result objects from the predictions.

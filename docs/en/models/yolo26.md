@@ -105,6 +105,22 @@ This unified framework covers real-time detection, instance segmentation, semant
 
     [`yolo26-p2.yaml`](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/models/26/yolo26-p2.yaml) and [`yolo26-p6.yaml`](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/models/26/yolo26-p6.yaml) add a P2 (small-object) or P6 (large-input) detection head and are shipped as YAML architectures only. No scale-specific `yolo26*-p2.pt` or `yolo26*-p6.pt` weights are released. Instantiate a scaled config from YAML (for example, `YOLO("yolo26n-p6.yaml")`) and train or fine-tune it as needed.
 
+!!! note "RoI mask head"
+
+    `yolo26-seg-roi.yaml` keeps the YOLO26 backbone, neck, and end-to-end box head, and replaces `Segment26` / `Proto26` prototype-coefficient masks with RoIAlign on P3, P4, and P5 plus a class-agnostic mask head. Masks are cropped from the one-to-one boxes both at train time and at inference. No pretrained weights are released.
+
+    ```python
+    from ultralytics import YOLO
+
+    model = YOLO("yolo26n-seg-roi.yaml")
+    head_index = len(model.model.model) - 1
+    freeze = list(range(head_index)) + model.model.model[-1].mask_only_freeze(head_index)
+    model.train(data="coco8-seg.yaml", epochs=50, freeze=freeze)  # stage 1: RoI mask head only
+    model.train(data="coco8-seg.yaml", epochs=50)  # stage 2: joint finetune
+    ```
+
+    PyTorch training, validation, and inference work. ONNX and the other export formats do not. This variant has no Proto26 semantic-auxiliary loss, and it does not add P2 features or cascade refinement. The default `yolo26-seg.yaml` proto model is unchanged.
+
 ## Performance Metrics
 
 <canvas id="modelComparisonChart" width="1024" height="400" active-models='["YOLO26"]'></canvas>

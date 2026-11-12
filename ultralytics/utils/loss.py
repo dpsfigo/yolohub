@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ultralytics.utils.metrics import CITYSCAPES_WEIGHT, OKS_SIGMA, RLE_WEIGHT
-from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import crop_mask, roi_align, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import (
     PoseTaskAlignedAssigner,
     RotatedTaskAlignedAssigner,
@@ -706,6 +706,84 @@ class SegmentLoss26(v8SegmentationLoss):
         return super().get_assigned_targets_and_loss(
             preds, batch, pd_coef=pd_coef, mask_scale=mask_scale, proto=proto, gt_masks=gt_masks
         )
+
+
+class SegmentLoss26RoI(v8DetectionLoss):
+    """BCE mask loss on RoIAlign crops from one-to-one boxes.
+
+    Box, class, and DFL/L1 stay on the shared detection assigner. The mask term runs only for predictions that carry
+    `roi_feats`, which `Segment26RoI` attaches to the one-to-one branch. Each positive box is cropped from the FPN
+    level its area selects, and the logit mask is compared with the ground-truth mask cropped by that same predicted
+    box. The one-to-many branch has no `roi_feats`, so it trains detection only.
+    """
+
+    def __init__(self, model: torch.nn.Module, tal_topk: int = 10, tal_topk2: int | None = None):
+        """Initialize the RoI mask loss. `model` must be de-paralleled."""
+        super().__init__(model, tal_topk, tal_topk2)
+        self.loss_names = ("box_loss", "seg_loss", *self.loss_names[1:])
+        self.overlap = model.args.overlap_mask
+        self.head = model.model[-1]
+
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple:
+        """Return detection loss plus the one-to-one RoI mask loss, scaled by batch size."""
+        (fg_mask, target_gt_idx, _, _, _), det_loss, _ = self.get_assigned_targets_and_loss(preds, batch)
+        loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl/l1
+        loss[0], loss[2], loss[3] = det_loss[0], det_loss[1], det_loss[2]
+        if preds.get("roi_feats") is not None:
+            loss[1] = self._roi_loss(preds, batch, fg_mask, target_gt_idx)
+        loss[1] = loss[1] + self._mask_reg()
+        loss[1] *= self.hyp.box  # seg gain, same multiplier as the prototype mask loss
+        return loss * preds["boxes"].shape[0], dict(zip(self.loss_names, loss.detach()))
+
+    def _roi_loss(self, preds, batch, fg_mask, target_gt_idx) -> torch.Tensor:
+        """BCE between predicted RoI masks and ground-truth masks sampled on the same predicted boxes."""
+        if not fg_mask.any():
+            return preds["boxes"].sum() * 0
+        image_idx, anchor_idx = fg_mask.nonzero(as_tuple=True)
+        boxes = self._pred_boxes_px(preds)[image_idx, anchor_idx]
+        keep = (boxes[:, 2:] - boxes[:, :2] > 1).all(1)
+        if not keep.any():
+            return preds["boxes"].sum() * 0
+        image_idx, anchor_idx, boxes = image_idx[keep], anchor_idx[keep], boxes[keep]
+        gt = self._gt_masks(batch, image_idx, target_gt_idx[image_idx, anchor_idx], boxes)
+        feat = preds["feats"][0]
+        img_h = float(feat.shape[2] * self.stride[0])
+        img_w = float(feat.shape[3] * self.stride[0])
+        mask_h, mask_w = gt.shape[-2:]
+        scale = boxes.new_tensor([mask_w / img_w, mask_h / img_h, mask_w / img_w, mask_h / img_h])
+        mask_boxes = self.head._valid_xyxy(boxes * scale)
+        index = torch.arange(len(mask_boxes), device=self.device, dtype=boxes.dtype)[:, None]
+        rois = torch.cat((index, mask_boxes), 1)
+        target = roi_align(gt[:, None], rois, self.head.mask_size, spatial_scale=1.0, sampling_ratio=2)
+        pred = self.head.mask_logits(preds["roi_feats"], boxes, image_idx)
+        return F.binary_cross_entropy_with_logits(pred, target.gt(0.5).to(pred.dtype).squeeze(1))
+
+    def _pred_boxes_px(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode one-to-one boxes to input-image xyxy pixels, detached so the mask loss does not move them."""
+        pred_dist = preds["boxes"].permute(0, 2, 1).contiguous()
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        return (self.bbox_decode(anchor_points, pred_dist) * stride_tensor).detach()
+
+    def _gt_masks(self, batch, image_idx, gt_idx, boxes) -> torch.Tensor:
+        """Gather the matched ground-truth mask for each positive, as `(R, H, W)` float."""
+        masks = batch["masks"].to(self.device, dtype=boxes.dtype)
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks = masks.squeeze(1)
+        gt_idx = gt_idx.long()
+        if self.overlap:
+            return (masks[image_idx] == (gt_idx + 1).view(-1, 1, 1)).to(boxes.dtype)
+        batch_idx = batch["batch_idx"].view(-1).long().to(self.device)
+        counts = torch.bincount(batch_idx, minlength=int(image_idx.max()) + 1)
+        rows = (counts.cumsum(0) - counts)[image_idx] + gt_idx
+        return masks[rows]
+
+    def _mask_reg(self) -> torch.Tensor:
+        """Zero term that keeps the mask parameters in the graph when a branch has no positive RoIs."""
+        reg = torch.zeros((), device=self.device)
+        for module in (self.head.roi_proj, self.head.mask_head):
+            for param in module.parameters():
+                reg = reg + param.sum()
+        return reg * 0
 
 
 class v8PoseLoss(v8DetectionLoss):
