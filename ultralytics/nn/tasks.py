@@ -71,6 +71,7 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
+    Segment26RoI,
     SemanticSegment,
     TorchVision,
     WorldDetect,
@@ -96,6 +97,7 @@ from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
     SegmentLoss26,
+    SegmentLoss26RoI,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
@@ -714,8 +716,14 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
-        loss = SegmentLoss26 if isinstance(self.model[-1], Segment26) else v8SegmentationLoss
-        return E2ELoss(self, loss) if getattr(self.model[-1], "one2one_cv2", None) is not None else loss(self)
+        head = self.model[-1]
+        if isinstance(head, Segment26RoI):
+            loss = SegmentLoss26RoI
+        elif isinstance(head, Segment26):
+            loss = SegmentLoss26
+        else:
+            loss = v8SegmentationLoss
+        return E2ELoss(self, loss) if getattr(head, "one2one_cv2", None) is not None else loss(self)
 
 
 class SemanticSegmentationModel(BaseModel):
@@ -2204,6 +2212,7 @@ def parse_model(d, ch, verbose=True):
                 YOLOEDetect,
                 Segment,
                 Segment26,
+                Segment26RoI,
                 YOLOESegment,
                 YOLOESegment26,
                 Pose,
@@ -2213,9 +2222,21 @@ def parse_model(d, ch, verbose=True):
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
-            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
+            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26 or m is Segment26RoI:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                Segment26RoI,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is Depth:
             args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store
@@ -2339,7 +2360,7 @@ def guess_model_task(model):
         for m in model.modules():
             if isinstance(m, SemanticSegment):
                 return "semantic"
-            elif isinstance(m, (Segment, YOLOESegment)):
+            elif isinstance(m, (Segment, YOLOESegment, Segment26RoI)):
                 return "segment"
             elif isinstance(m, Classify):
                 return "classify"

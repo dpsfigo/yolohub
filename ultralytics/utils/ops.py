@@ -680,6 +680,137 @@ def process_mask_native(protos, masks_in, bboxes, shape):
     return crop_mask(masks, bboxes)
 
 
+def roi_align(feat, rois, output_size, spatial_scale=1.0, sampling_ratio=2):
+    """Crop RoIs with aligned bilinear sampling and average the samples inside each bin.
+
+    This is Mask R-CNN RoIAlign (half-pixel shift, `sampling_ratio` points per bin) written with `grid_sample`, so it
+    trains and profiles without a custom op. Pixel centers sit on integer coordinates, and samples outside the map are
+    zero.
+
+    Args:
+        feat (torch.Tensor): Source map with shape `(N, C, H, W)`.
+        rois (torch.Tensor): Boxes with shape `(R, 5)` as batch index, x1, y1, x2, y2 in the unscaled pixel frame.
+        output_size (int): Square crop side, in bins.
+        spatial_scale (float): Multiplier from box pixels to `feat` pixels.
+        sampling_ratio (int): Samples along each side of a bin.
+
+    Returns:
+        (torch.Tensor): Crops with shape `(R, C, output_size, output_size)`.
+    """
+    count, channels = rois.shape[0], feat.shape[1]
+    side, ratio = int(output_size), int(sampling_ratio)
+    if ratio < 1:
+        raise ValueError(f"sampling_ratio must be >= 1, got {sampling_ratio}")
+    if count == 0:
+        return feat.new_zeros(0, channels, side, side)
+    samples = side * ratio
+    batch = rois[:, 0].to(dtype=torch.long)
+    boxes = rois[:, 1:5] * float(spatial_scale) - 0.5
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    height, width = feat.shape[-2:]
+    step = (torch.arange(samples, device=feat.device, dtype=feat.dtype) + 0.5) / samples
+    ys = y1[:, None] + (y2 - y1)[:, None] * step
+    xs = x1[:, None] + (x2 - x1)[:, None] * step
+    gy = ys[:, :, None].expand(count, samples, samples)
+    gx = xs[:, None, :].expand(count, samples, samples)
+
+    def _inside(coord, size):
+        """Clamp onto pixel centers and mark samples that fall outside the map, as RoIAlign does."""
+        valid = (coord >= -1) & (coord <= size)
+        return coord.clamp(0, max(size - 1, 0)), valid
+
+    gx, valid_x = _inside(gx, width)
+    gy, valid_y = _inside(gy, height)
+    valid = (valid_x & valid_y).to(dtype=feat.dtype)
+
+    def _grid(coord, size):
+        return torch.zeros_like(coord) if size <= 1 else 2 * coord / (size - 1) - 1
+
+    grid = torch.stack((_grid(gx, width), _grid(gy, height)), -1)
+    chunks, index = [], []
+    for image in range(feat.shape[0]):
+        sel = (batch == image).nonzero(as_tuple=True)[0]
+        if sel.numel() == 0:
+            continue
+        sampled = F.grid_sample(
+            feat[image : image + 1].expand(sel.numel(), -1, -1, -1),
+            grid[sel],
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        chunks.append(sampled * valid[sel][:, None])
+        index.append(sel)
+    if not chunks:
+        return feat.new_zeros(count, channels, side, side)
+    dense = torch.cat(chunks, 0)
+    if ratio > 1:
+        dense = F.avg_pool2d(dense, ratio)
+    return feat.new_zeros(count, channels, side, side).index_copy(0, torch.cat(index), dense)
+
+
+def roi_mask_pair(preds):
+    """Return `(detections, roi_logits)` when `preds` is a Segment26RoI inference output.
+
+    RoI inference returns `((det, logits), raw)` or `(det, logits)`, with `det` shaped `(B, K, 6)` and logits shaped
+    `(B, K, M, M)`. Prototype heads append mask coefficients, so their detection tensor is wider than 6 columns and
+    does not match.
+
+    Args:
+        preds (torch.Tensor | tuple): Model output from predict or validation.
+
+    Returns:
+        (tuple[torch.Tensor, torch.Tensor] | None): Detections and per-box mask logits, or None for every other head.
+    """
+    head = preds[0] if isinstance(preds, tuple) and preds and isinstance(preds[0], tuple) else preds
+    if not (isinstance(head, tuple) and len(head) == 2):
+        return None
+    det, extra = head
+    if (
+        isinstance(det, torch.Tensor)
+        and isinstance(extra, torch.Tensor)
+        and det.ndim == 3
+        and extra.ndim == 4
+        and det.shape[-1] == 6
+        and extra.shape[:2] == det.shape[:2]
+        and extra.shape[-1] == extra.shape[-2]
+    ):
+        return det, extra
+    return None
+
+
+def paste_roi_masks(masks: torch.Tensor, boxes: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+    """Paste class-agnostic RoI mask logits into image-sized binary masks.
+
+    Args:
+        masks (torch.Tensor): Logits with shape `(N, mask_h, mask_w)`. Values above 0 are foreground.
+        boxes (torch.Tensor): Bounding boxes with shape `(N, 4)` in xyxy pixels of `shape`.
+        shape (tuple[int, int]): Canvas height and width.
+
+    Returns:
+        (torch.Tensor): Binary uint8 masks with shape `(N, height, width)`.
+    """
+    count = masks.shape[0]
+    height, width = int(shape[0]), int(shape[1])
+    if count == 0:
+        return torch.zeros((0, height, width), dtype=torch.uint8, device=masks.device)
+    canvas = masks.new_zeros((count, height, width), dtype=torch.float32)
+    x1, y1, x2, y2 = boxes.detach().unbind(-1)
+    x1 = x1.clamp(0, width).round().to(torch.int)
+    x2 = x2.clamp(0, width).round().to(torch.int)
+    y1 = y1.clamp(0, height).round().to(torch.int)
+    y2 = y2.clamp(0, height).round().to(torch.int)
+    for index in range(count):
+        left, top, right, bottom = (int(v) for v in (x1[index], y1[index], x2[index], y2[index]))
+        if right <= left or bottom <= top:
+            continue
+        patch = F.interpolate(
+            masks[index][None, None].float(), (bottom - top, right - left), mode="bilinear", align_corners=False
+        )
+        canvas[index, top:bottom, left:right] = patch[0, 0]
+    return canvas.gt(0).to(torch.uint8)
+
+
 def scale_masks(
     masks: torch.Tensor,
     shape: tuple[int, int],

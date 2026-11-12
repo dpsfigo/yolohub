@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from ultralytics.models.yolo.detect import DetectionValidator
-from ultralytics.utils import LOGGER, ops
+from ultralytics.utils import LOGGER, nms, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import SegmentMetrics, mask_iou
 
@@ -67,6 +67,7 @@ class SegmentationValidator(DetectionValidator):
             model (torch.nn.Module): Model to validate.
         """
         super().init_metrics(model)
+        self.roi_head = self._roi_head(model)
         if self.args.save_json:
             check_requirements("faster-coco-eval>=1.6.7")
         # More accurate vs faster
@@ -99,6 +100,9 @@ class SegmentationValidator(DetectionValidator):
         Returns:
             (list[dict[str, torch.Tensor]]): Processed detection predictions with masks.
         """
+        roi = ops.roi_mask_pair(preds)
+        if roi is not None:
+            return self._postprocess_roi(*roi)
         proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         preds = super().postprocess(preds[0])
         imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
@@ -106,6 +110,55 @@ class SegmentationValidator(DetectionValidator):
             coefficient = pred.pop("extra")
             pred["masks"] = self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
         return preds
+
+    @staticmethod
+    def _roi_head(model: torch.nn.Module):
+        """Return the Segment26RoI head, walking AutoBackend and PyTorch wrappers, or None for a proto model."""
+        seen = set()
+        current = model
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, torch.nn.Sequential):
+                head = current[-1]
+                return head if getattr(head, "roi_masks", False) else None
+            current = getattr(current, "model", None)
+        return None
+
+    def _postprocess_roi(self, det: torch.Tensor, roi_masks: torch.Tensor) -> list[dict[str, torch.Tensor]]:
+        """Confidence-filter one-to-one boxes and paste RoI logits at the validator's mask resolution."""
+        outputs, keepi = nms.non_max_suppression(
+            det,
+            self.args.conf,
+            self.args.iou,
+            classes=None if self.args.single_cls and self.nc == 1 else self.args.classes,
+            nc=self.nc,
+            multi_label=True,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            end2end=True,
+            return_idxs=True,
+        )
+        head = self.roi_head
+        if head is None or not getattr(head, "mask_imgsz", None):
+            raise RuntimeError(
+                "Segment26RoI did not record the input size. Export of this head is not supported; validate in PyTorch."
+            )
+        height, width = head.mask_imgsz
+        # Match SegmentationValidator._prepare_batch, which compares non-native masks at imgsz / 4.
+        native = bool(self.args.save_json or self.args.save_txt or self.args.tile)
+        ratio = 1 if native else 4
+        mask_h, mask_w = height // ratio, width // ratio
+        sy, sx = mask_h / height, mask_w / width
+        result = []
+        for pred, idx, masks in zip(outputs, keepi, roi_masks):
+            boxes = pred[:, :4]
+            if pred.shape[0] == 0:
+                pasted = masks.new_zeros((0, mask_h, mask_w), dtype=torch.uint8)
+            else:
+                canvas_boxes = boxes * boxes.new_tensor([sx, sy, sx, sy]) if ratio != 1 else boxes
+                pasted = ops.paste_roi_masks(masks[idx], canvas_boxes, (mask_h, mask_w))
+            result.append({"bboxes": boxes, "conf": pred[:, 4], "cls": pred[:, 5], "masks": pasted})
+        return result
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
         """Prepare a batch for validation by processing images and targets.

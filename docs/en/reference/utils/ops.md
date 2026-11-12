@@ -100,6 +100,18 @@ keywords: Ultralytics, utility operations, non-max suppression, bounding box tra
 
 <br><br><hr><br>
 
+## ::: ultralytics.utils.ops.roi_align
+
+<br><br><hr><br>
+
+## ::: ultralytics.utils.ops.roi_mask_pair
+
+<br><br><hr><br>
+
+## ::: ultralytics.utils.ops.paste_roi_masks
+
+<br><br><hr><br>
+
 ## ::: ultralytics.utils.ops.scale_masks
 
 <br><br><hr><br>
