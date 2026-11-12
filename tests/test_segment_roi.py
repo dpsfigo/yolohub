@@ -11,6 +11,7 @@ from ultralytics import YOLO
 from ultralytics.cfg import get_cfg
 from ultralytics.models.yolo.segment.predict import SegmentationPredictor
 from ultralytics.models.yolo.segment.val import SegmentationValidator
+from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.nn.modules.head import Segment26, Segment26RoI
 from ultralytics.nn.tasks import SegmentationModel
 from ultralytics.utils import ops
@@ -51,6 +52,10 @@ def test_yolo26_seg_roi_forward_and_loss():
     proto = SegmentationModel("yolo26n-seg.yaml", nc=4, verbose=False)
     assert type(proto.model[-1]) is Segment26
     assert not getattr(proto.model[-1], "roi_masks", False)
+    proto.eval()
+    proto_out = proto(torch.rand(1, 3, 64, 64))
+    assert ops.roi_mask_pair(proto_out) is None
+    assert ops.roi_mask_pair(list(proto_out)) is None
 
     yolo = YOLO("yolo26n-seg-roi.yaml")
     assert yolo.task == "segment"
@@ -137,3 +142,64 @@ def test_yolo26_seg_roi_forward_and_loss():
     fused = model(img)
     fused_det, fused_roi = ops.roi_mask_pair(fused)
     assert fused_roi.shape[:2] == fused_det.shape[:2]
+
+
+def test_segment26_roi_eval_postprocess_uses_roi_masks(monkeypatch):
+    """Eval-mode RoI val and predict paste box masks and never call proto matmul."""
+
+    def _forbid_proto(*args, **kwargs):
+        raise AssertionError("proto mask matmul")
+
+    monkeypatch.setattr(ops, "process_mask", _forbid_proto)
+    monkeypatch.setattr(ops, "process_mask_native", _forbid_proto)
+
+    model = SegmentationModel("yolo26n-seg-roi.yaml", nc=1, verbose=False)
+    model.eval()
+    imgsz = 64
+    img = torch.rand(2, 3, imgsz, imgsz)
+    backend = AutoBackend(model, device="cpu", verbose=False)
+    preds = backend(img)
+    head = SegmentationValidator._roi_head(backend)
+    assert head is not None and head.mask_imgsz == (imgsz, imgsz)
+    det, roi = preds[0]
+    det, roi = det.clone(), roi.clone()
+    det.zero_()
+    roi.fill_(-4)
+    det[0, 0, :6] = torch.tensor([8.0, 8.0, 40.0, 48.0, 0.95, 0.0])
+    roi[0, 0].fill_(4)
+    listed = [(det, roi), preds[1]]  # AutoBackend shape used by final_eval, val, and predict
+    outputs = (listed, ((det, roi), preds[1]))
+
+    validator = SegmentationValidator.__new__(SegmentationValidator)
+    validator.args = get_cfg(overrides={"task": "segment", "conf": 0.25, "iou": 0.7})
+    validator.nc = head.nc
+    validator.roi_head = head
+    validator.end2end = True
+    validator.process = ops.process_mask
+    for output in outputs:
+        processed = validator.postprocess(output)
+        masks = processed[0]["masks"]
+        assert masks.dtype == torch.uint8
+        assert masks.shape == (1, imgsz // 4, imgsz // 4)
+        assert bool(masks[0, 2:12, 2:10].all())
+        assert int(masks.sum()) == 80
+        assert torch.allclose(processed[0]["bboxes"], torch.tensor([[8.0, 8.0, 40.0, 48.0]]))
+        assert processed[1]["masks"].shape == (0, imgsz // 4, imgsz // 4)
+
+    validator.args.save_json = True
+    native = validator.postprocess(listed)[0]["masks"]
+    assert native.shape == (1, imgsz, imgsz)
+    assert bool(native[0, 8:48, 8:40].all())
+    assert int(native.sum()) == 32 * 40
+
+    predictor = SegmentationPredictor(overrides={"conf": 0.25, "imgsz": imgsz})
+    predictor.model = backend
+    predictor.batch = (["a.jpg", "b.jpg"], None, None)
+    blank = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
+    results = predictor.postprocess(listed, img, [blank, blank])
+    data = results[0].masks.data
+    assert data.dtype == torch.uint8
+    assert data.shape == (1, imgsz, imgsz)
+    assert bool(data[0, 8:48, 8:40].all())
+    assert int(data.sum()) == 32 * 40
+    assert results[1].masks is None

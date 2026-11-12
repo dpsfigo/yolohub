@@ -753,19 +753,20 @@ def roi_mask_pair(preds):
     """Return `(detections, roi_logits)` when `preds` is a Segment26RoI inference output.
 
     RoI inference returns `((det, logits), raw)` or `(det, logits)`, with `det` shaped `(B, K, 6)` and logits shaped
-    `(B, K, M, M)`. Prototype heads append mask coefficients, so their detection tensor is wider than 6 columns and
-    does not match.
+    `(B, K, M, M)`. Validation and prediction wrap that tuple in a list. Prototype heads append mask coefficients, so
+    their detection tensor is wider than 6 columns and does not match.
 
     Args:
-        preds (torch.Tensor | tuple): Model output from predict or validation.
+        preds (torch.Tensor | tuple | list): Model output from predict or validation.
 
     Returns:
         (tuple[torch.Tensor, torch.Tensor] | None): Detections and per-box mask logits, or None for every other head.
     """
-    head = preds[0] if isinstance(preds, tuple) and preds and isinstance(preds[0], tuple) else preds
-    if not (isinstance(head, tuple) and len(head) == 2):
+    if isinstance(preds, (list, tuple)) and preds and isinstance(preds[0], (list, tuple)):
+        preds = preds[0]
+    if not (isinstance(preds, (list, tuple)) and len(preds) == 2):
         return None
-    det, extra = head
+    det, extra = preds
     if (
         isinstance(det, torch.Tensor)
         and isinstance(extra, torch.Tensor)
